@@ -11,5 +11,26 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ev-scheduler-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:///./ev_scheduler.db
+      RL_BACKEND: auto
+      USE_GPU: "true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./backend:/app
+
 volumes:
   postgres_data:

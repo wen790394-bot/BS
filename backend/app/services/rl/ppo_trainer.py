@@ -1,4 +1,4 @@
-"""PPO 策略优化 + Mamba-PPO 联合路径与充电推理"""
+"""PPO 策略优化 + Mamba-PPO 联合路径与充电推理（PyTorch GPU / NumPy 双模式）。"""
 
 from __future__ import annotations
 
@@ -6,16 +6,21 @@ import copy
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import ChargeStation, TaskInfo, VehicleInfo
 from app.services.energy.consumption import EnergyConsumptionService
 from app.services.routing.location import RouteNode, parse_location
 from app.services.routing.path_planner import PathPlanner
 from app.services.routing.vrp_solver import VRPSolver
-from app.services.rl.actor_critic import ActorCritic
+from app.services.rl.actor_critic import NumpyActorCritic, TorchActorCritic, create_actor_critic
+from app.services.rl.device import device_info, get_torch_device
 from app.services.rl.env import EnvConfig, SchedulingEnv
 from app.services.scheduling.charge_scheduler import ChargeScheduler
 
@@ -37,26 +42,37 @@ class PPOTrainer:
         self.path_planner = PathPlanner()
         self.charge_scheduler = ChargeScheduler()
         self.energy = EnergyConsumptionService()
-        self._policies: dict[str, ActorCritic] = {}
+        self._policies: dict[str, Any] = {}
+        self._optimizers: dict[str, torch.optim.Adam] = {}
         self._trained: dict[str, bool] = {}
+        self._use_torch = settings.rl_backend != "numpy"
 
-    def _get_policy(self, algorithm: str) -> ActorCritic:
+    def _get_policy(self, algorithm: str):
         if algorithm not in self._policies:
-            self._policies[algorithm] = ActorCritic(algorithm=algorithm)
+            self._policies[algorithm] = create_actor_critic(algorithm)
+            if self._use_torch and isinstance(self._policies[algorithm], TorchActorCritic):
+                self._optimizers[algorithm] = torch.optim.Adam(
+                    self._policies[algorithm].parameters(),
+                    lr=settings.ppo_lr,
+                )
             self._bootstrap_policy(algorithm)
         return self._policies[algorithm]
 
-    def _bootstrap_policy(self, algorithm: str, episodes: int = 80) -> None:
-        """在演示环境上快速预训练，使推理即可产生可行路线。"""
+    def _bootstrap_policy(self, algorithm: str, episodes: int | None = None) -> None:
         if self._trained.get(algorithm):
             return
+        episodes = episodes or settings.bootstrap_episodes
         policy = self._policies[algorithm]
         config = SchedulingEnv.demo_config()
         for ep in range(episodes):
             env = SchedulingEnv(config)
             buffer = self._run_episode(env, policy, deterministic=False)
             if buffer.rewards:
-                self._ppo_update(policy, buffer, lr=0.02 if ep < 20 else 0.008)
+                lr = 0.02 if ep < 20 else 0.008
+                if self._use_torch and isinstance(policy, TorchActorCritic):
+                    self._ppo_update_torch(policy, self._optimizers[algorithm], buffer)
+                else:
+                    self._ppo_update_numpy(policy, buffer, lr=lr)
         self._trained[algorithm] = True
 
     def _enrich_state(self, env: SchedulingEnv, state: dict) -> dict:
@@ -69,7 +85,7 @@ class PPOTrainer:
     def _run_episode(
         self,
         env: SchedulingEnv,
-        policy: ActorCritic,
+        policy: Any,
         deterministic: bool = False,
         max_steps: int = 30,
     ) -> RolloutBuffer:
@@ -118,9 +134,11 @@ class PPOTrainer:
         rewards: list[float],
         values: list[float],
         dones: list[bool],
-        gamma: float = 0.99,
-        lam: float = 0.95,
+        gamma: float | None = None,
+        lam: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        gamma = gamma or settings.ppo_gamma
+        lam = lam or settings.ppo_gae_lambda
         n = len(rewards)
         advantages = np.zeros(n)
         returns = np.zeros(n)
@@ -139,20 +157,72 @@ class PPOTrainer:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages, returns
 
-    def _ppo_update(
+    def _ppo_update_torch(
         self,
-        policy: ActorCritic,
+        policy: TorchActorCritic,
+        optimizer: torch.optim.Adam,
         buffer: RolloutBuffer,
-        lr: float = 0.01,
-        clip_eps: float = 0.2,
     ) -> dict:
         if not buffer.rewards:
             return {"loss": 0.0}
 
-        advantages, returns = self._compute_gae(
-            buffer.rewards, buffer.values, buffer.dones,
-        )
+        advantages, returns = self._compute_gae(buffer.rewards, buffer.values, buffer.dones)
+        policy.train()
+        actor_loss_total = 0.0
+        critic_loss_total = 0.0
+        count = 0
 
+        for i, state in enumerate(buffer.states):
+            action = buffer.actions[i]
+            candidates = action.get("candidates") or state.get("feasible_actions") or []
+            if not candidates:
+                continue
+
+            logits, _ = policy.score_candidates(state, candidates)
+            probs = F.softmax(logits, dim=0)
+            idx = min(action.get("action_idx", 0), len(candidates) - 1)
+
+            new_log_prob = torch.log(probs[idx] + 1e-8)
+            old_log_prob = torch.tensor(buffer.log_probs[i], device=logits.device)
+            ratio = torch.exp(new_log_prob - old_log_prob)
+            adv = torch.tensor(advantages[i], device=logits.device)
+
+            surr1 = ratio * adv
+            surr2 = torch.clamp(ratio, 1.0 - settings.ppo_clip_eps, 1.0 + settings.ppo_clip_eps) * adv
+            actor_loss = -torch.min(surr1, surr2)
+
+            value = policy.evaluate(state)
+            ret = torch.tensor(returns[i], device=value.device)
+            critic_loss = 0.5 * (value - ret) ** 2
+
+            loss = actor_loss + critic_loss
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            optimizer.step()
+
+            actor_loss_total += float(actor_loss.item())
+            critic_loss_total += float(critic_loss.item())
+            count += 1
+
+        policy.eval()
+        return {
+            "actor_loss": actor_loss_total / max(count, 1),
+            "critic_loss": critic_loss_total / max(count, 1),
+        }
+
+    def _ppo_update_numpy(
+        self,
+        policy: NumpyActorCritic,
+        buffer: RolloutBuffer,
+        lr: float = 0.01,
+        clip_eps: float | None = None,
+    ) -> dict:
+        clip_eps = clip_eps or settings.ppo_clip_eps
+        if not buffer.rewards:
+            return {"loss": 0.0}
+
+        advantages, returns = self._compute_gae(buffer.rewards, buffer.values, buffer.dones)
         actor_loss_total = 0.0
         critic_loss_total = 0.0
         count = 0
@@ -204,7 +274,6 @@ class PPOTrainer:
         }
 
     def train(self, episodes: int = 200, algorithm: str = "mamba_ppo") -> dict:
-        """PPO 训练循环。"""
         policy = self._get_policy(algorithm)
         config = SchedulingEnv.demo_config()
         losses: list[dict] = []
@@ -213,18 +282,24 @@ class PPOTrainer:
             env = SchedulingEnv(config)
             buffer = self._run_episode(env, policy, deterministic=False)
             if buffer.rewards:
-                loss = self._ppo_update(policy, buffer)
+                if self._use_torch and isinstance(policy, TorchActorCritic):
+                    loss = self._ppo_update_torch(policy, self._optimizers[algorithm], buffer)
+                else:
+                    loss = self._ppo_update_numpy(policy, buffer)
                 losses.append(loss)
 
         self._trained[algorithm] = True
         avg_actor = np.mean([l["actor_loss"] for l in losses]) if losses else 0.0
         avg_critic = np.mean([l["critic_loss"] for l in losses]) if losses else 0.0
+        info = device_info()
         return {
             "status": "ok",
             "algorithm": algorithm,
             "episodes": episodes,
             "avg_actor_loss": round(float(avg_actor), 4),
             "avg_critic_loss": round(float(avg_critic), 4),
+            "device": info["device"],
+            "mamba_backend": info["mamba_backend"],
         }
 
     def _finalize_route(self, env: SchedulingEnv) -> list[str]:
@@ -249,12 +324,7 @@ class PPOTrainer:
             route.append(env.depot_id)
         return route
 
-    def _evaluate_route(
-        self,
-        config: EnvConfig,
-        route: list[str],
-        algorithm: str,
-    ) -> dict:
+    def _evaluate_route(self, config: EnvConfig, route: list[str], algorithm: str) -> dict:
         nodes = config.nodes
         solver = VRPSolver(
             nodes=nodes,
@@ -426,7 +496,6 @@ class PPOTrainer:
         temperature: float = 25.0,
         num_rollouts: int = 5,
     ) -> dict:
-        """联合路径 + 充电策略推理。"""
         start = time.perf_counter()
         policy = self._get_policy(algorithm)
 
@@ -470,7 +539,6 @@ class PPOTrainer:
                     best_result = result
 
         if best_result is None:
-            config = SchedulingEnv.demo_config()
             fallback = self.path_planner.demo_instance(
                 battery_capacity_kwh=battery_capacity_kwh,
                 initial_soc=initial_soc,
@@ -497,6 +565,7 @@ class PPOTrainer:
 
         runtime = time.perf_counter() - start
         route_id = str(uuid.uuid4())
+        info = device_info()
 
         return {
             "route_id": route_id,
@@ -504,6 +573,8 @@ class PPOTrainer:
             "runtime": round(runtime, 4),
             "route_data": {
                 "algorithm": algorithm,
+                "device": info["device"],
+                "mamba_backend": info["mamba_backend"],
                 "vehicles": vehicle_ids,
                 "tasks": task_ids or config.task_ids,
                 "routes": [{

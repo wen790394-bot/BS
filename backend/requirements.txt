@@ -5,5 +5,6 @@ psycopg2-binary>=2.9.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 numpy>=1.26.0
-# torch>=2.0.0
-# mamba-ssm
+# PyTorch：Docker 镜像 state-spaces/mamba/mamba-ssm_causal-convld:v2 已预装
+# 本地开发可: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# mamba-ssm / causal-conv1d 在 Mamba Docker 镜像内已预装，无需 pip 安装

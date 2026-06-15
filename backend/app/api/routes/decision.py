@@ -3,10 +3,17 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.schemas.schedule import ScheduleRequest, ScheduleResponse, TrainRequest
+from app.services.rl.device import device_info
 from app.services.rl.ppo_trainer import PPOTrainer
+from app.utils.terminal_output import log_decision_summary
 
 router = APIRouter()
 ppo_trainer = PPOTrainer()
+
+
+def _finish_decision(result: dict) -> ScheduleResponse:
+    log_decision_summary(result)
+    return ScheduleResponse(**result)
 
 
 @router.post("/run", response_model=ScheduleResponse)
@@ -28,7 +35,7 @@ def run_decision(payload: ScheduleRequest, db: Session = Depends(get_db)):
             speed_kmh=payload.speed_kmh,
             temperature=payload.temperature,
         )
-        return ScheduleResponse(**result)
+        return _finish_decision(result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -43,12 +50,15 @@ def train_decision(payload: TrainRequest):
 def demo_decision():
     """演示：Mamba-PPO 智能决策"""
     result = ppo_trainer.infer(algorithm="mamba_ppo", use_demo=True)
-    return ScheduleResponse(**result)
+    return _finish_decision(result)
 
 
 @router.get("/algorithms")
 def list_algorithms():
+    info = device_info()
     return {
+        "device": info["device"],
+        "mamba_backend": info["mamba_backend"],
         "algorithms": [
             {"id": "mamba_ppo", "name": "Mamba-PPO", "description": "Mamba 时序编码 + PPO 策略优化"},
             {"id": "transformer_ppo", "name": "Transformer-PPO", "description": "Transformer 注意力编码 + PPO"},

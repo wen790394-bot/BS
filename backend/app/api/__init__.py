@@ -6,6 +6,7 @@ from app.api.routes import (
     decision,
     routing,
     scheduling,
+    system,
     tasks,
     vehicles,
 )
@@ -18,3 +19,4 @@ api_router.include_router(battery.router, prefix="/battery", tags=["电池健康
 api_router.include_router(routing.router, prefix="/routing", tags=["路径规划"])
 api_router.include_router(scheduling.router, prefix="/scheduling", tags=["充电调度"])
 api_router.include_router(decision.router, prefix="/decision", tags=["智能决策"])
+api_router.include_router(system.router, prefix="/system", tags=["系统"])
